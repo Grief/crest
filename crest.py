@@ -1,7 +1,11 @@
 #!/usr/bin/python2
 import cookielib
 import json, os, re, readline, sys, traceback, urllib, urllib2
+import socket
 from getpass import getpass
+
+HEADER_PREFIX = 'header-'
+HEADER_PREFIX_SKIP = len(HEADER_PREFIX)
 
 ENCODINGS = ['utf8', 'cp1251']
 
@@ -66,13 +70,12 @@ def output(*args):
     print
 
 
-def die(message):
+def stop(message):
     output(('error', 'CRITICAL ERROR:\n  {}'.format(message)))
     raise CriticalException
 
 
-def split(string):
-    return [x[1:-1] if x.startswith("'") and x.endswith("'") else x for x in re.split("( |'.*?')", string) if x.strip()]
+def split(string): return [x[1:-1] if x.startswith("'") and x.endswith("'") else x for x in re.split("( |'.*?')", string) if x.strip()]
 
 def print_map(map):
     if map:
@@ -88,11 +91,16 @@ def request(method, url, body, verbosity):
         'detailed': LEVEL_DETAILED,
         'full': LEVEL_VERBOSE
     }
-    if verbosity not in levels: die('{} is not a valid verbosity level, choose from: {}'.format(verbosity, ', '.join(levels.keys())))
+    if verbosity not in levels: stop('{} is not a valid verbosity level, choose from: {}'.format(verbosity, ', '.join(levels.keys())))
     level = levels[verbosity]
 
     method = method.upper()
     if level >= LEVEL_MODEST: output((C_WORD, method), ' ', (C_TEXT, url))
+
+    headers = {}
+    for var, value in variables.iteritems():
+        if var.startswith(HEADER_PREFIX): headers[var[HEADER_PREFIX_SKIP:]] = value
+
     if body: headers['Content-Length'] = len(body)
     elif 'Content-Length' in headers: del headers['Content-Length']
 
@@ -108,7 +116,8 @@ def request(method, url, body, verbosity):
         opener = urllib2.build_opener(NoRedirection, urllib2.HTTPCookieProcessor(cj))
         urllib2.build_opener = lambda *handlers: opener
 
-        response = urllib2.urlopen(req)
+        response = urllib2.urlopen(req, timeout=TIMEOUT)
+    except socket.timeout: stop('Connection to {} timed out'.format(url))
     except urllib2.HTTPError as response: pass
 
     if level >= LEVEL_MODEST: output((C_WORD, response.code), ' ', (C_TEXT, response.msg))
@@ -126,28 +135,13 @@ def request(method, url, body, verbosity):
     if 300 <= response.code < 400: request('get', response.headers['Location'], None, verbosity)
 
 
-def re_extract(string, prefix, re_values, re_names):
-    values = re.compile(re_values).findall(string)
-    if re_names is None:
-        times = len(values)
-        if times != 1: die('{} found {} times'.format(re_values, times) + (', '.join(values) if times > 1 else ''))
-        variables[prefix] = values[0]
-    else:
-        for k, v in zip(re.compile(re_names).findall(string), values): variables['-'.join((prefix, k))] = v
-
-
-def form(method, url, prefix, verbosity):
-    skip, data = len(prefix) + 1, {}
-    for v in variables:
-        if v.startswith(prefix): data[v[skip:]] = variables[v]
-    request(method, url, urllib.urlencode(data), verbosity)
-
 def sub(name):
     if '.' in name:
         path = name.split('.')
         var = variables
         for p in path: var = var[p]
         return var
+    if name not in variables: stop('Variable {} is not defined'.format(name))
     return variables[name]
 
 
@@ -157,11 +151,11 @@ def resolve(params):
 
 def call(params):
     name, params = params[0], resolve(params[1:])
-    if name not in funcs: die('Unknown function: {}'.format(name))
+    if name not in funcs: stop('Unknown function: {}'.format(name))
     func = funcs[name]
     if 'lambda' in func: func['lambda'](*params)
     else:
-        if len(func['params']) != len(params): die('Function {} takes {} arguments ({} given)'.format(name, len(func['params']), len(params)))
+        if len(func['params']) != len(params): stop('Function {} takes {} arguments ({} given)'.format(name, len(func['params']), len(params)))
         for k, v in zip(func['params'], params): variables[k] = v
 
         for command in func['body']: call(command)
@@ -188,62 +182,78 @@ def load_conf(verbose):
                 num += 1
         if verbose: output((C_WORD, conf_file), (C_TEXT, ' reloaded'))
 
-def list_commands():
-    signatures = [(f, ' '.join(funcs[f]['params'])) for f in sorted(funcs.keys())]
-    for name, params in signatures:
-        c_name, c_params = (C_WORD, C_TEXT) if 'lambda' in funcs[name] else (C_KEY, C_VALUE)
-        output((c_name, name), ' ', (c_params, params), '\n    ', ('info', 'TODO: add description'), '\n')
+def get_command_help(command):
+    if 'lambda' in funcs[command]:
+        return funcs[command]['lambda'].__doc__
+    return 'TODO: add description'
 
 
-def basic(func, help):
-    return {
-        'params': func.func_code.co_varnames,
-        'lambda': func
-    }
+def basic_commands():
+    def ask(var, prompt='>', hidden=''):
+        """ Asks user for the value of the variable var """
+        variables[var] = (getpass if hidden.lower() == 'hidden' else raw_input)(prompt + ' ')
 
-def set_header(header, value): headers[header] = value
-def set_variable(name, value):
-    if value is None: del variables[name]
-    else: variables[name] = value
-def drop_header(header): del headers[header]
+    def echo(message):
+        """ Outputs the message to the screen """
+        output(('info', message))
 
+    def set_(var, value=None):
+        """ Sets the value of the variable var"""
+        if value is None: del variables[var]
+        else: variables[var] = value
 
-def ask(var, prompt, hidden):
-    variables[var] = (getpass if hidden.lower() == 'hidden' else raw_input)(prompt + ' ')
+    def get(url, verbosity=VERBOSITY): request('GET',  url, None, verbosity)
+    def post(url, body='', verbosity=VERBOSITY): request('POST', url, body, verbosity)
+    def delete(url, verbosity=VERBOSITY): request('GET',  url, None, verbosity)
 
+    def reload_():
+        """ Reloads the configuration files """
+        load_conf(True)
+
+    def form(method, url, prefix, verbosity=VERBOSITY):
+        skip, data = len(prefix) + 1, {}
+        for v in variables:
+            if v.startswith(prefix): data[v[skip:]] = variables[v]
+        request(method, url, urllib.urlencode(data), verbosity)
+
+    def re_extract(string, prefix, re_values, re_names=None):
+        values = re.compile(re_values).findall(string)
+        if re_names is None:
+            times = len(values)
+            if times != 1: stop('{} found {} times'.format(re_values, times) + (', '.join(values) if times > 1 else ''))
+            variables[prefix] = values[0]
+        else:
+            for k, v in zip(re.compile(re_names).findall(string), values): variables['-'.join((prefix, k))] = v
+
+    def list_variables():
+        print_map(variables)
+    def list_commands():
+        signatures = [(f, ' '.join(funcs[f]['params'])) for f in sorted(funcs.keys())]
+        for name, params in signatures:
+            c_name, c_params = (C_WORD, C_TEXT) if 'lambda' in funcs[name] else (C_KEY, C_VALUE)
+            output((c_name, name), ' ', (c_params, params), '\n    ', ('info', get_command_help(name)), '\n')
+
+    commands = {}
+    for func_name, func in locals().iteritems():
+        if not hasattr(func, 'func_code'): continue
+        # print name, func.func_code.co_varnames, func.func_defaults
+        if func_name.endswith('_'): func_name = func_name[:-1]
+        func_name = func_name.replace('_', '-')
+        commands[func_name] = {
+            'params': func.func_code.co_varnames,
+            'lambda': func
+        }
+    return commands
 
 if __name__ == '__main__':
     VERBOSITY = 'full'
-    # url_base = 'http://' + sys.argv[1]
+    TIMEOUT = 10
 
-    variables = {
-        'response': {}
-    }
-    headers = {}
-    # noinspection PyTypeChecker
-    funcs = {
-        'echo'          : basic(lambda message: output(('info', message))                  , ''),
-        'set'           : basic(lambda name, value=None: set_variable(name, value)         , ''),
-        'ask'           : basic(lambda var, prompt='>', hidden='': ask(var, prompt, hidden), ''),
-
-        'get'           : basic(lambda url, verbosity=VERBOSITY: request('GET', url, None, verbosity)                 , ''),
-        'post'          : basic(lambda url, body, verbosity=VERBOSITY: request('POST', url, body, verbosity)          , ''),
-        'form'          : basic(lambda method, url, prefix, verbosity=VERBOSITY: form(method, url, prefix, verbosity) , ''),
-        'delete'        : basic(lambda url, verbosity=VERBOSITY: request('DELETE', url, None, verbosity)              , ''),
-
-        're-extract'    : basic(lambda string, prefix, re_values, re_names=None: re_extract(string, prefix, re_values, re_names), ''),
-
-        'set-header'    : basic(lambda header, value: set_header(header, value)                            , ''),
-        'drop-header'   : basic(lambda header: drop_header(header)                                         , ''),
-
-        'reload'        : basic(lambda: load_conf(True)                                                    , ''),
-        'list-commands' : basic(lambda: list_commands()                                                    , ''),
-        'list-variables': basic(lambda: print_map(variables)                                               , ''),
-
-        '.before': {
-            'params': [],
-            'body': []
-        }
+    variables = {'response': {}}
+    funcs = basic_commands()
+    funcs['.before'] = {
+        'params': [],
+        'body': []
     }
 
     load_conf(False)
