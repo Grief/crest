@@ -1,0 +1,12 @@
+function vk-authorize
+    get https://oauth.vk.com/authorize?client_id=5142654&scope=wall&redirect_uri=http://oauth.vk.com/blank.html&display=page&response_type=token silent
+    re-extract ${response.body} vk-login-form <input[^<]+hidden[^<]+value="(.+?)" <input[^<]+hidden[^<]+name="(.+?)"
+
+    echo 'Please enter you credentials for vk.com'
+    ask vk-login-form-email 'Email:'
+    ask vk-login-form-pass  'Password:' hidden
+
+    form post https://login.vk.com/?act=login&soft=1 vk-login-form silent
+    set vk-login-form-pass
+    re-extract ${url} vk-access-token access_token=([0-9a-fA-F]+)
+    echo 'Access token: ${vk-access-token}'
