@@ -1,5 +1,5 @@
 # cREST
-Command line tool for scenario-based interaction with RESTful services.
+Command line tool for scenario-based interaction with RESTful services. **It is in progress, so if you are interested in such tool, please don't hesistate to leave you opinion and share your thoughts**
 
 ## Installation
 **cREST** is a single python script. Place it anywhere you want but please make sure that it would have a read/write access to `crest.conf` directory nearby.
